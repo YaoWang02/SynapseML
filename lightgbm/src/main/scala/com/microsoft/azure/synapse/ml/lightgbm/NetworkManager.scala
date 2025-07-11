@@ -27,14 +27,21 @@ case class TaskMessageInfo(status: String,
                            localListenPort: Int,
                            partitionId: Int,
                            executorId: String) {
-  def this(status: String) = this(status, "", -1, -1, "") // Constructor for general messages, not Task-connected
+  def this(status: String) = this(status, "", -1, -1, "")
 
   val isForTraining: Boolean = status == LightGBMConstants.EnabledTask
   val isForLoadOnly: Boolean = status == LightGBMConstants.IgnoreStatus
   val isFinished: Boolean = status == LightGBMConstants.FinishedStatus
 
-  // Format all the information as a delimited string to send to driver
-  override def toString: String = s"$status:$taskHost:$localListenPort:$partitionId:$executorId"
+  // 支持IPv6的格式化
+  override def toString: String = {
+    val hostPart = if (taskHost.contains(":") && !taskHost.startsWith("[")) {
+      s"[$taskHost]" // 为IPv6地址添加方括号
+    } else {
+      taskHost
+    }
+    s"$status:$hostPart:$localListenPort:$partitionId:$executorId"
+  }
 }
 
 case class NetworkTopologyInfo(lightgbmNetworkString: String,
@@ -130,6 +137,8 @@ object NetworkManager {
                                        localListenPort: Int,
                                        log: Logger,
                                        shouldExecuteTraining: Boolean): NetworkTopologyInfo = {
+    log.info(s"ipAddress: ${networkParams.ipAddress}, port: ${networkParams.port}, " +
+      s"localListenPort: $localListenPort, partitionId: $partitionId, taskId: $taskId")
     using(new Socket(networkParams.ipAddress, networkParams.port)) {
       driverSocket =>
         usingMany(Seq(new BufferedReader(new InputStreamReader(driverSocket.getInputStream)),
@@ -221,13 +230,29 @@ object NetworkManager {
     if (nodesList.isEmpty) {
       throw new Exception("Error: could not split nodes list correctly")
     }
-    val mainNode = nodesList(0)
-    val hostAndPort = mainNode.split(":")
-    if (hostAndPort.length != 2) {
-      throw new Exception("Error: could not parse main worker host and port correctly")
+    val mainNode = nodesList(0).trim
+    
+    // 支持IPv6的解析逻辑
+    val (mainHost, mainPort) = if (mainNode.startsWith("[")) {
+      // IPv6格式: [2001:db8::1]:8080
+      val closeBracketIndex = mainNode.indexOf("]:")
+      if (closeBracketIndex == -1) {
+        throw new Exception("Error: could not parse IPv6 address correctly")
+      }
+      val host = mainNode.substring(0, closeBracketIndex + 1)
+      val port = mainNode.substring(closeBracketIndex + 2)
+      (host, port)
+    } else {
+      // IPv4格式: 192.168.1.1:8080
+      val lastColonIndex = mainNode.lastIndexOf(":")
+      if (lastColonIndex == -1) {
+        throw new Exception("Error: could not find port separator")
+      }
+      val host = mainNode.substring(0, lastColonIndex)
+      val port = mainNode.substring(lastColonIndex + 1)
+      (host, port)
     }
-    val mainHost = hostAndPort(0)
-    val mainPort = hostAndPort(1)
+    
     log.info(s"LightGBM setting main worker host: $mainHost and port: $mainPort")
     mainPort.toInt
   }
@@ -277,18 +302,41 @@ object NetworkManager {
     }.get
   }
 
-  def parseWorkerMessage(message: String): TaskMessageInfo = {
-    val components = message.split(":")
+  def parseWorkerMessage(message: String, log: Logger): TaskMessageInfo = {
+    val components = message.split(":", -1) // 使用-1避免丢弃空字符串
     val status = components(0)
 
     if (status == LightGBMConstants.FinishedStatus) new TaskMessageInfo(status)
     else {
-      if (components.length != 5) throw new Exception(s"Unexpected message: $message")
+      // 对于IPv6，组件数量可能超过5个
+      if (components.length < 5) throw new Exception(s"Unexpected message format: $message")
 
-      val host = components(1)
-      val port = components(2).toInt
-      val partitionId: Int = components(3).toInt
-      val executorId = components(4)  //scalastyle:ignore magic.number
+      // 重新组装可能包含冒号的主机地址
+      val host = if (components(1).startsWith("[")) {
+        // IPv6地址：找到匹配的]，然后重新组装
+        val hostParts = components.drop(1).takeWhile(!_.endsWith("]"))
+        val lastPart = components(1 + hostParts.length)
+        log.info(s"Detected IPv6 address - ${hostParts.mkString(":")}:$lastPart")
+        (hostParts :+ lastPart).mkString(":")
+      } else {
+        // IPv4地址
+        log.info(s"Detected IPv4 address - host: ${components(1)}")
+        components(1)
+      }
+      log.info(s"Parsed host: $host")
+      val remainingIndex = if (host.contains("[")) {
+        // 计算IPv6地址占用了多少个组件
+        2 + host.count(_ == ':')
+      } else {
+        2 // IPv4只占用2个位置（status:host）
+      }
+      log.info(s"Remaining index for port and partitionId: $remainingIndex")
+      
+      val port = components(remainingIndex).toInt
+      val partitionId = components(remainingIndex + 1).toInt
+      val executorId = components(remainingIndex + 2)
+      log.info(s"Parsed message - status: $status, host: $host, port: $port, partitionId: $partitionId, executorId: $executorId")
+      
       TaskMessageInfo(status, host, port, partitionId, executorId)
     }
   }
@@ -315,8 +363,16 @@ case class NetworkManager(numTasks: Int,
   // Also make sure the order is deterministic by sorting on minimum partition id
   private lazy val networkTopologyAsString: String = {
     val hostPortsList = hostAndPorts.map(_._2).sortBy(hostPort => {
-      val host = hostPort.split(":")(0)
-      hostToMinPartition(host)
+      val host = if (hostPort.startsWith("[")) {
+        // IPv6格式: [2001:db8::1]:8080
+        val closeBracketIndex = hostPort.indexOf("]:")
+        if (closeBracketIndex != -1) hostPort.substring(0, closeBracketIndex + 1)
+        else hostPort.split(":")(0) // 备用解析
+      } else {
+        // IPv4格式: 192.168.1.1:8080
+        hostPort.split(":")(0)
+      }
+      hostToMinPartition.getOrElse(host, Int.MaxValue)
     })
     hostPortsList.mkString(",")
   }
@@ -383,7 +439,7 @@ case class NetworkManager(numTasks: Int,
     val reader = new BufferedReader(new InputStreamReader(socket.getInputStream))
     val messageStr = reader.readLine()
     log.info(s"received worker message string: $messageStr")
-    val message: TaskMessageInfo = parseWorkerMessage(messageStr)
+    val message: TaskMessageInfo = parseWorkerMessage(messageStr, log)
 
     if (message.isFinished) {
       log.info("driver received all tasks from barrier stage")
