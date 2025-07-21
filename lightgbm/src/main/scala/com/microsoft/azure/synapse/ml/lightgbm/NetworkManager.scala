@@ -40,7 +40,8 @@ case class TaskMessageInfo(status: String,
     } else {
       taskHost
     }
-    s"$status:$hostPart:$localListenPort:$partitionId:$executorId"
+    // host和port之间用空格分隔
+    s"$status:$hostPart $localListenPort:$partitionId:$executorId"
   }
 }
 
@@ -232,26 +233,14 @@ object NetworkManager {
     }
     val mainNode = nodesList(0).trim
     
-    // 支持IPv6的解析逻辑
-    val (mainHost, mainPort) = if (mainNode.startsWith("[")) {
-      // IPv6格式: [2001:db8::1]:8080
-      val closeBracketIndex = mainNode.indexOf("]:")
-      if (closeBracketIndex == -1) {
-        throw new Exception("Error: could not parse IPv6 address correctly")
-      }
-      val host = mainNode.substring(0, closeBracketIndex + 1)
-      val port = mainNode.substring(closeBracketIndex + 2)
-      (host, port)
-    } else {
-      // IPv4格式: 192.168.1.1:8080
-      val lastColonIndex = mainNode.lastIndexOf(":")
-      if (lastColonIndex == -1) {
-        throw new Exception("Error: could not find port separator")
-      }
-      val host = mainNode.substring(0, lastColonIndex)
-      val port = mainNode.substring(lastColonIndex + 1)
-      (host, port)
+    // 使用空格分隔 host 和 port，无需在意 IPv6 还是 IPv4
+    val spaceIndex = mainNode.lastIndexOf(" ")
+    if (spaceIndex == -1) {
+      throw new Exception("Error: could not find space separator between host and port")
     }
+    
+    val mainHost = mainNode.substring(0, spaceIndex)
+    val mainPort = mainNode.substring(spaceIndex + 1)
     
     log.info(s"LightGBM setting main worker host: $mainHost and port: $mainPort")
     mainPort.toInt
@@ -302,40 +291,40 @@ object NetworkManager {
     }.get
   }
 
-  def parseWorkerMessage(message: String, log: Logger): TaskMessageInfo = {
+  def parseWorkerMessage(message: String): TaskMessageInfo = {
     val components = message.split(":", -1) // 使用-1避免丢弃空字符串
     val status = components(0)
 
     if (status == LightGBMConstants.FinishedStatus) new TaskMessageInfo(status)
     else {
-      // 对于IPv6，组件数量可能超过5个
-      if (components.length < 5) throw new Exception(s"Unexpected message format: $message")
-
+      // 对于IPv6，组件数量可能超过4个
+      if (components.length < 4) throw new Exception(s"Unexpected message format: $message")
       // 重新组装可能包含冒号的主机地址
-      val host = if (components(1).startsWith("[")) {
+      val hostAndPort = if (components(1).startsWith("[")) {
         // IPv6地址：找到匹配的]，然后重新组装
-        val hostParts = components.drop(1).takeWhile(!_.endsWith("]"))
-        val lastPart = components(1 + hostParts.length)
-        log.info(s"Detected IPv6 address - ${hostParts.mkString(":")}:$lastPart")
-        (hostParts :+ lastPart).mkString(":")
+        val frontParts = components.drop(1).takeWhile(!_.contains("]"))
+        val lastPart = components(1 + frontParts.length)
+        (frontParts :+ lastPart).mkString(":")
       } else {
         // IPv4地址
-        log.info(s"Detected IPv4 address - host: ${components(1)}")
         components(1)
       }
-      log.info(s"Parsed host: $host")
-      val remainingIndex = if (host.contains("[")) {
+      val remainingIndex = if (hostAndPort.contains("[")) {
         // 计算IPv6地址占用了多少个组件
-        2 + host.count(_ == ':')
+        2 + hostAndPort.count(_ == ':')
       } else {
-        2 // IPv4只占用2个位置（status:host）
+        2
       }
-      log.info(s"Remaining index for port and partitionId: $remainingIndex")
+
+      val parts = hostAndPort.split(" ")
+      if (parts.length != 2) {
+        throw new Exception(s"Unexpected 'host port' format: $hostAndPort")
+      }
+      val host = parts(0)
+      val port = parts(1).toInt 
       
-      val port = components(remainingIndex).toInt
-      val partitionId = components(remainingIndex + 1).toInt
-      val executorId = components(remainingIndex + 2)
-      log.info(s"Parsed message - status: $status, host: $host, port: $port, partitionId: $partitionId, executorId: $executorId")
+      val partitionId = components(remainingIndex).toInt
+      val executorId = components(remainingIndex + 1)
       
       TaskMessageInfo(status, host, port, partitionId, executorId)
     }
@@ -359,19 +348,11 @@ case class NetworkManager(numTasks: Int,
   private val hostToMinPartition = mutable.Map[String, Int]()
   private val partitionsByExecutor = mutable.Map[String, List[Int]]()
 
-  // Concatenate with commas, eg: host1:port1,host2:port2, ... etc
+  // Concatenate with commas, eg: host1 port1,host2 port2, ... etc
   // Also make sure the order is deterministic by sorting on minimum partition id
   private lazy val networkTopologyAsString: String = {
     val hostPortsList = hostAndPorts.map(_._2).sortBy(hostPort => {
-      val host = if (hostPort.startsWith("[")) {
-        // IPv6格式: [2001:db8::1]:8080
-        val closeBracketIndex = hostPort.indexOf("]:")
-        if (closeBracketIndex != -1) hostPort.substring(0, closeBracketIndex + 1)
-        else hostPort.split(":")(0) // 备用解析
-      } else {
-        // IPv4格式: 192.168.1.1:8080
-        hostPort.split(":")(0)
-      }
+      val host = hostPort.split(" ")(0)
       hostToMinPartition.getOrElse(host, Int.MaxValue)
     })
     hostPortsList.mkString(",")
@@ -439,7 +420,7 @@ case class NetworkManager(numTasks: Int,
     val reader = new BufferedReader(new InputStreamReader(socket.getInputStream))
     val messageStr = reader.readLine()
     log.info(s"received worker message string: $messageStr")
-    val message: TaskMessageInfo = parseWorkerMessage(messageStr, log)
+    val message: TaskMessageInfo = parseWorkerMessage(messageStr)
 
     if (message.isFinished) {
       log.info("driver received all tasks from barrier stage")
@@ -450,7 +431,7 @@ case class NetworkManager(numTasks: Int,
           log.info("driver received load-only status from task")
           loadOnlyHostAndPorts += socket
         case m if m.isForTraining =>
-          val networkInfoString = s"${message.taskHost}:${message.localListenPort}"
+          val networkInfoString = s"${message.taskHost} ${message.localListenPort}"
           log.info(s"driver received socket from task: $networkInfoString")
           val socketAndMessage = (socket, networkInfoString)
           hostAndPorts += socketAndMessage
